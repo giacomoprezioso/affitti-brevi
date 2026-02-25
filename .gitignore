@@ -1,0 +1,17 @@
+# Secrets - NON committare mai
+.streamlit/secrets.toml
+
+# Backup Excel
+*_backup_*.xlsx
+
+# File temporanei
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/input/*
+data/processed/*
+*.pdf
+*.csv
+*.xls
+*.xlsx
