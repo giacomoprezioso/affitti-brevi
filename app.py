@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from parsers.airbnb import parse_airbnb_csv
 from parsers.booking import parse_booking_xlsx
+from parsers.booking_csv import parse_booking_csv
 from parsers.pdf_invoice import parse_pdf_invoice
 from core.sheets import save_to_sheets, load_elenco_from_sheets
 from core.models import Cost
@@ -49,8 +50,8 @@ with st.sidebar:
     st.caption("**Come esportare i file:**")
     with st.expander("Airbnb CSV"):
         st.write("Account → Transazioni → Esporta CSV")
-    with st.expander("Booking XLSX"):
-        st.write("Extranet → Finance → Pagamenti → Esporta")
+    with st.expander("Booking CSV / XLSX"):
+        st.write("Extranet → Finance → Pagamenti → Esporta (CSV o Excel)")
     with st.expander("PDF Fatture"):
         st.write("Carica direttamente le fatture PDF")
 
@@ -62,6 +63,32 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Dati")
     return buf.getvalue()
+
+
+# ── CSV auto-detect ──────────────────────────────────────────────────────────
+def _parse_csv_auto(filepath: str):
+    """
+    Distingue automaticamente CSV Airbnb da CSV Booking.
+    Airbnb: header contiene 'Codice di Conferma' o 'Confirmation Code'
+    Booking: header contiene 'Tipo/tipo di transazione' o prima riga dati ha '(Payout)'
+    """
+    try:
+        with open(filepath, encoding="utf-8-sig", errors="replace") as f:
+            first_line = f.readline().lower()
+    except Exception:
+        first_line = ""
+
+    is_booking = (
+        "tipo/tipo di transazione" in first_line
+        or "tipo di transazione" in first_line
+        or "payout" in first_line
+        or "descrizione della transazione" in first_line
+    )
+
+    if is_booking:
+        return "Booking CSV", parse_booking_csv(filepath)
+    else:
+        return "Airbnb CSV", parse_airbnb_csv(filepath)
 
 
 # ── Tabs ─────────────────────────────────────────────────────────────────────
@@ -101,11 +128,12 @@ with tab_import:
 
                 try:
                     if suffix == ".csv":
-                        bookings = parse_airbnb_csv(tmp_path)
+                        # Auto-detect: Airbnb o Booking CSV
+                        csv_type, bookings = _parse_csv_auto(tmp_path)
                         all_bookings.extend(bookings)
                         parse_results.append({
                             "File": uploaded_file.name,
-                            "Tipo": "Airbnb CSV",
+                            "Tipo": csv_type,
                             "Trovati": f"{len(bookings)} prenotazioni",
                         })
 
@@ -327,11 +355,13 @@ with tab_report:
 
                     # KPI
                     st.subheader("KPI")
-                    k1, k2, k3, k4 = st.columns(4)
+                    k1, k2, k3, k4, k5 = st.columns(5)
                     k1.metric("Prenotazioni", len(df_f))
                     k2.metric("Lordo totale €", f"{df_f['lordo'].sum():.2f}" if "lordo" in df_f else "—")
                     k3.metric("Netto totale €", f"{df_f['incassato'].sum():.2f}" if "incassato" in df_f else "—")
-                    k4.metric("Notti totali", int(df_f["giorni"].sum()) if "giorni" in df_f else "—")
+                    ritenuta_tot = df_f["ritenuta"].sum() if "ritenuta" in df_f.columns else 0
+                    k4.metric("Ritenute totali €", f"{ritenuta_tot:.2f}")
+                    k5.metric("Notti totali", int(df_f["giorni"].sum()) if "giorni" in df_f else "—")
 
                     st.divider()
 
@@ -357,15 +387,28 @@ with tab_report:
 
                     st.divider()
 
+                    # ── Pivot Ritenute per mese × proprietà ──
+                    if "ritenuta" in df_f.columns and df_f["ritenuta"].abs().sum() > 0:
+                        st.subheader("Ritenute fiscali per mese e proprietà (€)")
+                        pivot_rit = df_f.pivot_table(
+                            values="ritenuta", index="anno_mese", columns="proprieta",
+                            aggfunc="sum", fill_value=0, margins=True, margins_name="TOTALE"
+                        )
+                        st.dataframe(pivot_rit.round(2), use_container_width=True)
+                        st.divider()
+
                     # ── Per piattaforma ──
                     if col_ente in df_f.columns:
                         st.subheader("Per piattaforma")
-                        by_plat = df_f.groupby(col_ente).agg(
-                            prenotazioni=(col_ente, "count"),
-                            lordo_totale=("lordo", "sum"),
-                            netto_totale=("incassato", "sum"),
-                            notti=("giorni", "sum"),
-                        ).reset_index().round(2)
+                        agg_dict = {
+                            "prenotazioni": (col_ente, "count"),
+                            "lordo_totale": ("lordo", "sum"),
+                            "netto_totale": ("incassato", "sum"),
+                            "notti": ("giorni", "sum"),
+                        }
+                        if "ritenuta" in df_f.columns:
+                            agg_dict["ritenute"] = ("ritenuta", "sum")
+                        by_plat = df_f.groupby(col_ente).agg(**agg_dict).reset_index().round(2)
                         st.dataframe(by_plat, use_container_width=True, hide_index=True)
 
                     st.divider()
@@ -374,7 +417,7 @@ with tab_report:
                     st.subheader("Elenco prenotazioni")
                     cols_show = [c for c in [
                         "anno_mese", "proprieta", col_ente, "nominativo",
-                        "dal", "al", "giorni", "lordo", "commission", "incassato", "nr"
+                        "dal", "al", "giorni", "lordo", "commission", "incassato", "ritenuta", "nr"
                     ] if c in df_f.columns]
                     df_show = df_f[cols_show].sort_values("anno_mese", ascending=False)
                     st.dataframe(df_show, use_container_width=True, hide_index=True)
